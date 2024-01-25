@@ -1,7 +1,7 @@
 use super::{rejection::*, FromRequest, FromRequestParts, Request};
 use crate::{body::Body, RequestExt};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes};
 use http::{request::Parts, Extensions, HeaderMap, Method, Uri, Version};
 use http_body_util::BodyExt;
 use std::convert::Infallible;
@@ -79,15 +79,55 @@ where
     type Rejection = BytesRejection;
 
     async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
-        let bytes = req
-            .into_limited_body()
-            .collect()
+        // let bytes = req
+        //     .into_limited_body()
+        //     .collect()
+        //     .await
+        //     .map_err(FailedToBufferBody::from_err)?
+        //     .to_bytes();
+        let bytes = to_bytes(req.into_limited_body())
             .await
-            .map_err(FailedToBufferBody::from_err)?
-            .to_bytes();
+            .map_err(FailedToBufferBody::from_err)?;
 
         Ok(bytes)
     }
+}
+
+async fn to_bytes<T>(body: T) -> Result<Bytes, T::Error>
+where
+    T: http_body::Body<Data = Bytes>,
+{
+    futures_util::pin_mut!(body);
+    // body.frame().await
+
+    // If there's only 1 chunk, we can just return Buf::to_bytes()
+    let mut first = if let Some(buf) = body.frame().await {
+        buf?
+    } else {
+        return Ok(Bytes::new());
+    };
+    let first = first.data_mut().unwrap();
+
+    let mut second = if let Some(buf) = body.frame().await {
+        buf?
+    } else {
+        return Ok(first.copy_to_bytes(first.remaining()));
+    };
+    let second = second.data_mut().unwrap();
+
+    // With more than 1 buf, we gotta flatten into a Vec first.
+    let cap = first.remaining() + second.remaining() + body.size_hint().lower() as usize;
+    let mut vec = Vec::with_capacity(cap);
+    vec.put(first);
+    vec.put(second);
+
+    while let Some(buf) = body.frame().await {
+        let mut data = buf?;
+        let data = data.data_mut().unwrap();
+        vec.put(data);
+    }
+
+    Ok(vec.into())
 }
 
 #[async_trait]
